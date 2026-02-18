@@ -1,0 +1,18 @@
+# CNC Auto - Dependencies
+# Install with: pip install -r requirements.txt
+
+# Image capture and processing
+opencv-python>=4.8.0
+
+# Serial communication with Arduino/GRBL
+pyserial>=3.5
+
+# Numerical operations
+numpy>=1.24.0
+
+# Optional: Better image vectorization (install Potrace separately)
+# Potrace: https://potrace.sourceforge.net/
+# On Windows: download from https://potrace.sourceforge.net/#downloading
+# On Linux: sudo apt-get install potrace
+# On macOS: brew install potrace
+

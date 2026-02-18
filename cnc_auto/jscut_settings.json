@@ -1,0 +1,28 @@
+{
+    "_source": "Parsed from settings.jscut",
+    "_description": "Motion and tool parameters extracted from JSCut settings file",
+    "svg": {
+        "px_per_inch": 96
+    },
+    "material": {
+        "units": "mm",
+        "thickness": 0.5,
+        "z_origin": "Top",
+        "clearance": 100
+    },
+    "curve_to_line_conversion": {
+        "min_num_segments": 1,
+        "min_segment_length": 0.254
+    },
+    "tool": {
+        "units": "mm",
+        "diameter": 0.5,
+        "angle": 180,
+        "pass_depth": 0.5,
+        "stepover": 0.1,
+        "rapid_rate": 2540,
+        "plunge_rate": 100,
+        "cut_rate": 500
+    }
+}
+

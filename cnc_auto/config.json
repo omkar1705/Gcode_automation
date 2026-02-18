@@ -1,0 +1,123 @@
+{
+    "machine": {
+        "bed_size_x": 300,
+        "bed_size_y": 200,
+        "bed_size_z": 50,
+        "steps_per_mm_x": 800,
+        "steps_per_mm_y": 800,
+        "steps_per_mm_z": 800,
+        "home_offset_x": 0,
+        "home_offset_y": 0,
+        "home_offset_z": 0,
+        "origin_mode": "bottom-left",
+        "max_feed_rate_x": 3000,
+        "max_feed_rate_y": 3000,
+        "max_feed_rate_z": 1000
+    },
+    "camera": {
+        "device_index": 0,
+        "resolution_width": 1920,
+        "resolution_height": 1080,
+        "auto_detect_workarea": true,
+        "warmup_frames": 30,
+        "capture_dir": "captures"
+    },
+    "image_processing": {
+        "grayscale": true,
+        "blur_kernel_size": 5,
+        "adaptive_threshold_block_size": 11,
+        "adaptive_threshold_constant": 2,
+        "canny_low": 50,
+        "canny_high": 150,
+        "morph_kernel_size": 3,
+        "morph_iterations": 1,
+        "denoise_strength": 10,
+        "invert_image": false,
+        "contrast_alpha": 1.5,
+        "brightness_beta": 0
+    },
+    "vectorization": {
+        "method": "potrace",
+        "turdsize": 2,
+        "alphamax": 1.0,
+        "opttolerance": 0.2,
+        "min_path_length": 5,
+        "simplify_tolerance": 0.5,
+        "output_dir": "svg_output"
+    },
+    "gcode": {
+        "output_dir": "gcode_output",
+        "units": "mm",
+        "coordinate_mode": "absolute",
+        "spindle_enabled": false,
+        "spindle_speed": 10000,
+        "spindle_delay_seconds": 2.0,
+        "coolant_enabled": false,
+        "feed_rate_override": 1.0,
+        "scaling_factor": 1.0,
+        "maintain_aspect_ratio": true,
+        "fit_to_bed": true,
+        "margin_mm": 5.0,
+        "optimize_path_order": true,
+        "arc_tolerance": 0.01,
+        "header_gcode": [
+            "G90",
+            "G21",
+            "G17"
+        ],
+        "footer_gcode": [
+            "M5",
+            "G0 Z{safe_z}",
+            "G0 X0 Y0",
+            "M2"
+        ]
+    },
+    "sender_mode": "mqtt",
+
+    "serial": {
+        "port": "COM3",
+        "baud_rate": 115200,
+        "timeout": 2.0,
+        "buffer_size": 128,
+        "status_poll_interval": 0.1,
+        "dry_run": true,
+        "connect_retry_count": 3,
+        "connect_retry_delay": 2.0,
+        "grbl_init_wait": 2.0
+    },
+
+    "mqtt": {
+        "broker_host": "mqtt.omkartigade.tech",
+        "broker_port": 443,
+        "transport": "websockets",
+        "ws_path": "/mqtt",
+        "use_tls": true,
+        "username": "omkar",
+        "password": "omkar",
+        "keepalive": 60,
+        "qos": 1,
+        "dry_run": false,
+        "topic_command": "cnc/gcode/command",
+        "topic_ack": "cnc/gcode/ack",
+        "topic_control": "cnc/control",
+        "topic_status": "cnc/status",
+        "lines_per_chunk": 10,
+        "ack_timeout": 30.0,
+        "retry_count": 3
+    },
+    "logging": {
+        "level": "INFO",
+        "log_to_file": true,
+        "log_dir": "logs",
+        "max_log_size_mb": 10,
+        "backup_count": 5
+    },
+    "pipeline": {
+        "auto_run": false,
+        "skip_camera": false,
+        "input_image_path": null,
+        "save_intermediates": true,
+        "intermediate_dir": "intermediate"
+    }
+}
+
