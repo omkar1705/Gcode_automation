@@ -1,0 +1,41 @@
+BROKER = "your-broker"
+
+PORT = 8883
+
+USERNAME = "user"
+
+PASSWORD = "pass"
+
+
+
+TOPIC_CMD = "cnc/cmd"
+
+TOPIC_ACK = "cnc/ack"
+
+
+
+LINES_PER_CHUNK = 5
+
+ACK_TIMEOUT = 5
+
+RETRY_COUNT = 3
+
+
+
+SAFE_HEIGHT = 3.0
+
+CUT_DEPTH = -0.35
+
+PLUNGE_FEED = 70
+
+CUT_FEED = 180
+
+SPINDLE_DWELL = 1.5
+
+
+
+HOME_X = 0
+
+HOME_Y = 0
+
+HOME_Z = 0

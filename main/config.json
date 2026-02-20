@@ -1,0 +1,36 @@
+{
+
+  "mqtt": {
+
+    "broker_host": "mqtt.omkartigade.tech",
+
+    "broker_port": 443,
+
+    "transport": "websockets",
+
+    "ws_path": "/mqtt",
+
+    "use_tls": true,
+
+    "username": "omkar",
+
+    "password": "omkar",
+
+    "keepalive": 60,
+
+    "qos": 1,
+
+    "dry_run": false,
+
+    "machine_id": "cnc01",
+
+    "lines_per_chunk": 10,
+
+    "ack_timeout": 30.0,
+
+    "retry_count": 3
+
+  }
+
+}
+
