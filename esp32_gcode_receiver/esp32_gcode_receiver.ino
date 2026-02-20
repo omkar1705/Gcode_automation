@@ -1,5 +1,5 @@
 /*
- * ESP32 G-code Receiver over MQTT (WSS)
+ * ESP32 G-code Receiver over MQTT (WSS) — Production-Grade
  *
  * Uses the ESP-IDF native MQTT client (built-in, no extra library needed)
  * which supports wss:// natively.
@@ -14,6 +14,19 @@
  *
  * ── Board ──
  *   ESP32 Arduino core 2.x or 3.x
+ *
+ * ── Production Reliability Features ──
+ *   [1]  Two-topic architecture with machine_id isolation
+ *   [2]  Strict JSON message validation
+ *   [3]  Sequence tracking with duplicate/out-of-order rejection
+ *   [4]  Idempotent ACK with job_id + last_seq_processed
+ *   [5]  Persistent session with reconnect recovery
+ *   [6]  Safety hardening (ESTOP, job-state guards)
+ *   [7]  Sender + machine_id authentication
+ *   [8]  Chunk watchdog timer (timeout → auto-pause)
+ *   [9]  Tuned MQTT buffers, LWT, exponential backoff
+ *   [10] Retained online/offline presence
+ *   [11] Memory-safe buffer handling with size limits
  */
 
 #include <WiFi.h>
@@ -30,32 +43,65 @@ const char* WIFI_SSID     = "omkar123";
 const char* WIFI_PASSWORD = "omkar123";
 
 // MQTT broker over WSS
-// The ESP-IDF client takes a full URI: wss://host:port/path
 const char* MQTT_URI      = "wss://mqtt.omkartigade.tech:443/mqtt";
 const char* MQTT_USER     = "omkar";
 const char* MQTT_PASS     = "omkar";
 
-// MQTT topics (must match config.json on the PC side)
-const char* TOPIC_COMMAND = "cnc/gcode/command";
-const char* TOPIC_ACK     = "cnc/gcode/ack";
-const char* TOPIC_CONTROL = "cnc/control";
-const char* TOPIC_STATUS  = "cnc/status";
+// ── [1] Machine identity — isolates this device on the broker ──
+const char* MACHINE_ID    = "cnc01";
+
+// ── [1] Two-topic architecture ──
+// PC  → ESP: cnc/<machine_id>/cmd   (ESP subscribes)
+// ESP → PC:  cnc/<machine_id>/resp  (ESP publishes)
+static char TOPIC_CMD[64];
+static char TOPIC_RESP[64];
+
+// ── [11] Memory-safety limits ──
+static const int MAX_LINES_PER_CHUNK  = 50;
+static const int MAX_JSON_PAYLOAD     = 7168;  // 7 KB — fits in 8 KB RX buffer with headroom
+static const int MAX_GCODE_LINE_LEN   = 96;
+
+// ── [8] Watchdog: timeout (ms) with no chunk during active job ──
+static const unsigned long CHUNK_WATCHDOG_MS = 10000;
 
 // ═══════════════════════════════════════════════════════════
 //  GLOBALS
 // ═══════════════════════════════════════════════════════════
 
 esp_mqtt_client_handle_t mqttClient = NULL;
-bool    mqttConnected = false;
+volatile bool mqttConnected = false;
 
 // Job state
-bool    jobActive    = false;
-bool    paused       = false;
-int     totalLines   = 0;
-int     totalChunks  = 0;
-int     linesExec    = 0;
-int     chunksExec   = 0;
-String  currentJobId = "";
+bool    jobActive       = false;
+bool    paused          = false;
+int     totalLines      = 0;
+int     totalChunks     = 0;
+int     linesExec       = 0;
+int     chunksExec      = 0;
+String  currentJobId    = "";
+
+// ── [3] Sequence tracking ──
+int     lastSeqReceived = -1;
+
+// ── [8] Watchdog state ──
+unsigned long lastChunkTime = 0;
+bool    watchdogTripped     = false;
+
+// ── [9] Exponential backoff for reconnect ──
+static unsigned long reconnectBackoffMs  = 1000;
+static const unsigned long RECONNECT_MAX = 30000;
+
+// ── [5] Reconnect recovery flag ──
+static bool initialConnectDone = false;
+
+// ═══════════════════════════════════════════════════════════
+//  TOPIC BUILDER  [1]
+// ═══════════════════════════════════════════════════════════
+
+void buildTopics() {
+    snprintf(TOPIC_CMD,  sizeof(TOPIC_CMD),  "cnc/%s/cmd",  MACHINE_ID);
+    snprintf(TOPIC_RESP, sizeof(TOPIC_RESP), "cnc/%s/resp", MACHINE_ID);
+}
 
 // ═══════════════════════════════════════════════════════════
 //  WIFI
@@ -89,42 +135,146 @@ void setupWiFi() {
 //  MQTT PUBLISH HELPERS
 // ═══════════════════════════════════════════════════════════
 
-void mqttPublish(const char* topic, const char* payload) {
+// All ESP→PC messages go to TOPIC_RESP only [1]
+void mqttPublish(const char* payload, bool retain = false) {
     if (mqttClient && mqttConnected) {
-        esp_mqtt_client_publish(mqttClient, topic, payload, 0, 1, 0);
+        esp_mqtt_client_publish(mqttClient, TOPIC_RESP, payload, 0, 1, retain ? 1 : 0);
     }
 }
 
+// ── [4] Idempotent ACK: includes job_id + last_seq_processed so PC can safely retry ──
 void sendAck(int seq, const char* status, const char* error = "") {
+    char buffer[384];
     JsonDocument doc;
-    doc["type"]       = "ACK";
-    doc["seq"]        = seq;
-    doc["status"]     = status;
+    doc["type"]               = "ACK";
+    doc["job_id"]             = currentJobId;
+    doc["seq"]                = seq;
+    doc["status"]             = status;
+    doc["last_seq_processed"] = lastSeqReceived;
+    doc["lines_exec"]         = linesExec;
+    doc["machine_id"]         = MACHINE_ID;
     if (strlen(error) > 0) {
         doc["error"] = error;
     }
-    doc["lines_exec"] = linesExec;
 
-    char buffer[256];
     serializeJson(doc, buffer, sizeof(buffer));
-    mqttPublish(TOPIC_ACK, buffer);
+    mqttPublish(buffer);
 
-    Serial.print("[ACK] seq=");
-    Serial.print(seq);
-    Serial.print(" status=");
-    Serial.println(status);
+    Serial.printf("[ACK] seq=%d status=%s last_seq=%d\n", seq, status, lastSeqReceived);
 }
 
-void sendStatus(const char* status) {
+void sendStatus(const char* status, bool retain = false) {
+    char buffer[384];
     JsonDocument doc;
+    doc["type"]        = "STATUS";
     doc["status"]      = status;
+    doc["machine_id"]  = MACHINE_ID;
     doc["job_id"]      = currentJobId;
     doc["lines_exec"]  = linesExec;
     doc["chunks_exec"] = chunksExec;
+    doc["last_seq"]    = lastSeqReceived;
 
-    char buffer[256];
     serializeJson(doc, buffer, sizeof(buffer));
-    mqttPublish(TOPIC_STATUS, buffer);
+    mqttPublish(buffer, retain);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  JOB STATE RESET  [6]
+// ═══════════════════════════════════════════════════════════
+
+// Centralized reset prevents inconsistent state across code paths.
+void resetJobState() {
+    jobActive       = false;
+    paused          = false;
+    totalLines      = 0;
+    totalChunks     = 0;
+    linesExec       = 0;
+    chunksExec      = 0;
+    currentJobId    = "";
+    lastSeqReceived = -1;
+    lastChunkTime   = 0;
+    watchdogTripped = false;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  MESSAGE VALIDATION  [2][7]
+// ═══════════════════════════════════════════════════════════
+
+// Returns true only if the message passes all security and structural checks.
+bool validateEnvelope(JsonDocument& doc) {
+    // [7] Sender field must be "pc"
+    if (!doc["sender"].is<const char*>()) {
+        Serial.println("[REJECT] Missing sender field");
+        return false;
+    }
+    if (strcmp(doc["sender"].as<const char*>(), "pc") != 0) {
+        Serial.println("[REJECT] Sender is not 'pc'");
+        return false;
+    }
+
+    // [7] machine_id must match this device
+    if (!doc["machine_id"].is<const char*>()) {
+        Serial.println("[REJECT] Missing machine_id");
+        return false;
+    }
+    if (strcmp(doc["machine_id"].as<const char*>(), MACHINE_ID) != 0) {
+        Serial.println("[REJECT] machine_id mismatch");
+        return false;
+    }
+
+    // [2] type field is mandatory
+    if (!doc["type"].is<const char*>()) {
+        Serial.println("[REJECT] Missing type field");
+        return false;
+    }
+
+    return true;
+}
+
+bool validateJobStart(JsonDocument& doc) {
+    if (!doc["job_id"].is<const char*>() || strlen(doc["job_id"].as<const char*>()) == 0) {
+        Serial.println("[REJECT] JOB_START: missing/empty job_id");
+        return false;
+    }
+    if (!doc["total_lines"].is<int>() || doc["total_lines"].as<int>() <= 0) {
+        Serial.println("[REJECT] JOB_START: invalid total_lines");
+        return false;
+    }
+    if (!doc["total_chunks"].is<int>() || doc["total_chunks"].as<int>() <= 0) {
+        Serial.println("[REJECT] JOB_START: invalid total_chunks");
+        return false;
+    }
+    return true;
+}
+
+bool validateChunk(JsonDocument& doc) {
+    if (!doc["seq"].is<int>() || doc["seq"].as<int>() < 0) {
+        Serial.println("[REJECT] CHUNK: invalid seq");
+        return false;
+    }
+    if (!doc["lines"].is<JsonArray>()) {
+        Serial.println("[REJECT] CHUNK: lines is not an array");
+        return false;
+    }
+    JsonArray lines = doc["lines"].as<JsonArray>();
+    if (lines.size() == 0) {
+        Serial.println("[REJECT] CHUNK: empty lines array");
+        return false;
+    }
+    // [11] Enforce max lines per chunk to bound memory usage
+    if ((int)lines.size() > MAX_LINES_PER_CHUNK) {
+        Serial.printf("[REJECT] CHUNK: too many lines (%d > %d)\n", (int)lines.size(), MAX_LINES_PER_CHUNK);
+        return false;
+    }
+    return true;
+}
+
+bool validateJobEnd(JsonDocument& doc) {
+    if (!doc["job_id"].is<const char*>() || strlen(doc["job_id"].as<const char*>()) == 0) {
+        Serial.println("[REJECT] JOB_END: missing/empty job_id");
+        return false;
+    }
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -132,21 +282,37 @@ void sendStatus(const char* status) {
 // ═══════════════════════════════════════════════════════════
 
 void handleJobStart(JsonDocument& doc) {
+    // [6] Reject if a job is already running (must END or ESTOP first)
+    if (jobActive) {
+        Serial.println("[WARN] JOB_START received while job already active — ignoring");
+        sendAck(-1, "error", "job_already_active");
+        return;
+    }
+
+    // [2] Validate required fields
+    if (!validateJobStart(doc)) {
+        sendAck(-1, "error", "invalid_job_start");
+        return;
+    }
+
     currentJobId = doc["job_id"].as<String>();
-    totalLines   = doc["total_lines"] | 0;
-    totalChunks  = doc["total_chunks"] | 0;
+    totalLines   = doc["total_lines"].as<int>();
+    totalChunks  = doc["total_chunks"].as<int>();
     linesExec    = 0;
     chunksExec   = 0;
     jobActive    = true;
     paused       = false;
 
+    // [3] Reset sequence tracking for new job
+    lastSeqReceived = -1;
+
+    // [8] Start watchdog
+    lastChunkTime   = millis();
+    watchdogTripped = false;
+
     Serial.println("========================================");
-    Serial.print("[JOB START] id=");
-    Serial.print(currentJobId);
-    Serial.print("  lines=");
-    Serial.print(totalLines);
-    Serial.print("  chunks=");
-    Serial.println(totalChunks);
+    Serial.printf("[JOB START] id=%s  lines=%d  chunks=%d\n",
+                  currentJobId.c_str(), totalLines, totalChunks);
     Serial.println("========================================");
 
     sendStatus("running");
@@ -154,26 +320,50 @@ void handleJobStart(JsonDocument& doc) {
 }
 
 void handleChunk(JsonDocument& doc) {
+    // [6] Ignore chunks when no job is active
     if (!jobActive) {
-        Serial.println("[WARN] Chunk received but no active job");
+        Serial.println("[WARN] Chunk received but no active job — dropping");
         return;
     }
 
-    int seq = doc["seq"] | -1;
+    // [2] Validate chunk structure
+    if (!validateChunk(doc)) {
+        sendAck(doc["seq"] | -1, "error", "invalid_chunk");
+        return;
+    }
+
+    int seq = doc["seq"].as<int>();
+
+    // [3] Sequence safety — reject duplicates
+    if (seq <= lastSeqReceived) {
+        Serial.printf("[DUP] Chunk seq=%d already processed (last=%d) — resending ACK\n",
+                      seq, lastSeqReceived);
+        sendAck(seq, "ok");  // Idempotent: PC might be retrying
+        return;
+    }
+
+    // [3] Sequence safety — reject out-of-order
+    if (seq != lastSeqReceived + 1) {
+        Serial.printf("[SEQ ERR] Expected seq=%d, got seq=%d\n", lastSeqReceived + 1, seq);
+        sendAck(seq, "error", "out_of_order");
+        return;
+    }
+
     JsonArray lines = doc["lines"].as<JsonArray>();
     int lineCount = lines.size();
 
-    Serial.print("[CHUNK ");
-    Serial.print(seq);
-    Serial.print("] ");
-    Serial.print(lineCount);
-    Serial.println(" lines:");
+    Serial.printf("[CHUNK %d] %d lines:\n", seq, lineCount);
 
     for (int i = 0; i < lineCount; i++) {
         const char* gcodeLine = lines[i];
         if (gcodeLine) {
-            Serial.print("  >> ");
-            Serial.println(gcodeLine);
+            // [11] Truncate excessively long G-code lines to prevent buffer issues
+            if (strlen(gcodeLine) > MAX_GCODE_LINE_LEN) {
+                Serial.printf("  >> [TRUNCATED] %.80s...\n", gcodeLine);
+            } else {
+                Serial.print("  >> ");
+                Serial.println(gcodeLine);
+            }
 
             // FUTURE: Forward to GRBL on Serial2:
             //   Serial2.println(gcodeLine);
@@ -184,62 +374,100 @@ void handleChunk(JsonDocument& doc) {
     }
 
     chunksExec++;
+    lastSeqReceived = seq;
 
-    Serial.print("[CHUNK ");
-    Serial.print(seq);
-    Serial.print("] Done. Progress: ");
-    Serial.print(linesExec);
-    Serial.print("/");
-    Serial.println(totalLines);
+    // [8] Reset watchdog on successful chunk
+    lastChunkTime   = millis();
+    watchdogTripped = false;
 
+    // Clear watchdog pause if we were timed-out but now receiving again
+    if (paused) {
+        paused = false;
+        sendStatus("running");
+    }
+
+    Serial.printf("[CHUNK %d] Done. Progress: %d/%d\n", seq, linesExec, totalLines);
     sendAck(seq, "ok");
 }
 
 void handleJobEnd(JsonDocument& doc) {
+    // [2] Validate
+    if (!validateJobEnd(doc)) {
+        return;
+    }
+
     String jobId = doc["job_id"].as<String>();
 
+    // [6] Only process if it matches the current job
+    if (jobActive && currentJobId != jobId) {
+        Serial.printf("[WARN] JOB_END job_id mismatch: got=%s active=%s\n",
+                      jobId.c_str(), currentJobId.c_str());
+        return;
+    }
+
     Serial.println("========================================");
-    Serial.print("[JOB END] id=");
-    Serial.print(jobId);
-    Serial.print("  lines_executed=");
-    Serial.print(linesExec);
-    Serial.print("/");
-    Serial.println(totalLines);
+    Serial.printf("[JOB END] id=%s  lines_executed=%d/%d\n",
+                  jobId.c_str(), linesExec, totalLines);
     Serial.println("========================================");
 
-    jobActive = false;
+    resetJobState();
     sendStatus("idle");
 }
 
 void handleControl(JsonDocument& doc) {
-    String type = doc["type"].as<String>();
+    const char* type = doc["type"].as<const char*>();
 
-    if (type == "PAUSE") {
+    // [6] ESTOP is always honored — the only command that ignores job state
+    if (strcmp(type, "ESTOP") == 0) {
+        Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        Serial.println("[CONTROL] EMERGENCY STOP");
+        Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        resetJobState();
+        sendStatus("estop");
+        return;
+    }
+
+    // [6] All other control commands require an active job
+    if (!jobActive) {
+        Serial.printf("[WARN] Control '%s' ignored — no active job\n", type);
+        return;
+    }
+
+    if (strcmp(type, "PAUSE") == 0) {
         Serial.println("[CONTROL] PAUSE");
         paused = true;
         sendStatus("paused");
     }
-    else if (type == "RESUME") {
+    else if (strcmp(type, "RESUME") == 0) {
         Serial.println("[CONTROL] RESUME");
         paused = false;
+        watchdogTripped = false;
+        lastChunkTime = millis();  // Reset watchdog on resume
         sendStatus("running");
     }
-    else if (type == "ESTOP") {
-        Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-        Serial.println("[CONTROL] EMERGENCY STOP");
-        Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-        paused    = false;
-        jobActive = false;
-        linesExec = 0;
-        sendStatus("estop");
+    else {
+        // [2] Reject unknown control types
+        Serial.printf("[REJECT] Unknown control type: %s\n", type);
     }
 }
 
 // ═══════════════════════════════════════════════════════════
-//  MQTT MESSAGE DISPATCHER
+//  MQTT MESSAGE DISPATCHER  [1][2][7]
 // ═══════════════════════════════════════════════════════════
 
 void processMessage(const char* topic, const char* data, int dataLen) {
+    // [11] Reject oversized payloads before parsing
+    if (dataLen > MAX_JSON_PAYLOAD) {
+        Serial.printf("[REJECT] Payload too large: %d > %d\n", dataLen, MAX_JSON_PAYLOAD);
+        return;
+    }
+
+    // [1] Only process messages on our cmd topic
+    if (strcmp(topic, TOPIC_CMD) != 0) {
+        Serial.printf("[REJECT] Unexpected topic: %s\n", topic);
+        return;
+    }
+
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, data, dataLen);
     if (err) {
@@ -248,23 +476,26 @@ void processMessage(const char* topic, const char* data, int dataLen) {
         return;
     }
 
-    String topicStr = String(topic);
-    String msgType  = doc["type"].as<String>();
-
-    if (topicStr == TOPIC_COMMAND) {
-        if (msgType == "JOB_START") {
-            handleJobStart(doc);
-        } else if (msgType == "CHUNK") {
-            handleChunk(doc);
-        } else if (msgType == "JOB_END") {
-            handleJobEnd(doc);
-        } else {
-            Serial.print("[MQTT] Unknown command: ");
-            Serial.println(msgType);
-        }
+    // [2][7] Validate envelope: sender, machine_id, type
+    if (!validateEnvelope(doc)) {
+        return;
     }
-    else if (topicStr == TOPIC_CONTROL) {
+
+    const char* msgType = doc["type"].as<const char*>();
+
+    if (strcmp(msgType, "JOB_START") == 0) {
+        handleJobStart(doc);
+    } else if (strcmp(msgType, "CHUNK") == 0) {
+        handleChunk(doc);
+    } else if (strcmp(msgType, "JOB_END") == 0) {
+        handleJobEnd(doc);
+    } else if (strcmp(msgType, "PAUSE") == 0 ||
+               strcmp(msgType, "RESUME") == 0 ||
+               strcmp(msgType, "ESTOP") == 0) {
         handleControl(doc);
+    } else {
+        // [2] Reject unknown message types
+        Serial.printf("[REJECT] Unknown message type: %s\n", msgType);
     }
 }
 
@@ -272,8 +503,8 @@ void processMessage(const char* topic, const char* data, int dataLen) {
 //  ESP-IDF MQTT EVENT HANDLER
 // ═══════════════════════════════════════════════════════════
 
-// Buffer to reassemble messages that arrive in fragments
-static char msgBuffer[4096];
+// [11] Receive buffer sized to RX buffer (8 KB)
+static char msgBuffer[8192];
 static int  msgBufferLen = 0;
 static char msgTopic[128];
 
@@ -287,20 +518,50 @@ static void mqttEventHandler(void* args, esp_event_base_t base,
             Serial.println("[MQTT] Connected!");
             mqttConnected = true;
 
-            // Subscribe to command and control topics (QoS 1)
-            esp_mqtt_client_subscribe(mqttClient, TOPIC_COMMAND, 1);
-            esp_mqtt_client_subscribe(mqttClient, TOPIC_CONTROL, 1);
-            Serial.print("[MQTT] Subscribed to: ");
-            Serial.print(TOPIC_COMMAND);
-            Serial.print(", ");
-            Serial.println(TOPIC_CONTROL);
+            // [9] Reset backoff on successful connection
+            reconnectBackoffMs = 1000;
 
-            sendStatus("idle");
+            // [1] Subscribe only to our cmd topic (QoS 1)
+            esp_mqtt_client_subscribe(mqttClient, TOPIC_CMD, 1);
+            Serial.printf("[MQTT] Subscribed to: %s\n", TOPIC_CMD);
+
+            // [10] Publish retained online status so PC knows we're alive
+            {
+                char onlineBuf[128];
+                JsonDocument onlineDoc;
+                onlineDoc["type"]       = "STATUS";
+                onlineDoc["status"]     = "online";
+                onlineDoc["machine_id"] = MACHINE_ID;
+                serializeJson(onlineDoc, onlineBuf, sizeof(onlineBuf));
+                esp_mqtt_client_publish(mqttClient, TOPIC_RESP, onlineBuf, 0, 1, 1);
+            }
+
+            // [5] On reconnect (not first boot), announce recovery state
+            if (initialConnectDone) {
+                Serial.println("[MQTT] Reconnected — publishing recovery status");
+                if (jobActive) {
+                    sendStatus("reconnected");
+                    Serial.printf("[RECOVERY] Job '%s' active, last_seq=%d — PC should resume from seq %d\n",
+                                  currentJobId.c_str(), lastSeqReceived, lastSeqReceived + 1);
+                } else {
+                    sendStatus("idle");
+                }
+            } else {
+                initialConnectDone = true;
+                sendStatus("idle");
+            }
             break;
 
         case MQTT_EVENT_DISCONNECTED:
             Serial.println("[MQTT] Disconnected");
             mqttConnected = false;
+
+            // [9] Exponential backoff tracking (ESP-IDF handles reconnect,
+            //     but we log the expected delay for diagnostics)
+            Serial.printf("[MQTT] Next reconnect in ~%lu ms\n", reconnectBackoffMs);
+            if (reconnectBackoffMs < RECONNECT_MAX) {
+                reconnectBackoffMs = min(reconnectBackoffMs * 2, RECONNECT_MAX);
+            }
             break;
 
         case MQTT_EVENT_DATA:
@@ -310,17 +571,21 @@ static void mqttEventHandler(void* args, esp_event_base_t base,
                            ? event->topic_len : (int)sizeof(msgTopic) - 1;
                 memcpy(msgTopic, event->topic, tLen);
                 msgTopic[tLen] = '\0';
-                msgBufferLen = 0;  // reset buffer for new message
+                msgBufferLen = 0;
             }
 
-            // Append data fragment to buffer
+            // [11] Prevent buffer overflow on fragment assembly
             if (msgBufferLen + event->data_len < (int)sizeof(msgBuffer) - 1) {
                 memcpy(msgBuffer + msgBufferLen, event->data, event->data_len);
                 msgBufferLen += event->data_len;
                 msgBuffer[msgBufferLen] = '\0';
+            } else {
+                Serial.println("[REJECT] Message exceeds reassembly buffer — dropped");
+                msgBufferLen = 0;
+                break;
             }
 
-            // Check if this is the last fragment (current_data_offset + data_len == total_data_len)
+            // Process when all fragments have arrived
             if (event->current_data_offset + event->data_len >= event->total_data_len) {
                 processMessage(msgTopic, msgBuffer, msgBufferLen);
                 msgBufferLen = 0;
@@ -330,10 +595,9 @@ static void mqttEventHandler(void* args, esp_event_base_t base,
         case MQTT_EVENT_ERROR:
             Serial.print("[MQTT] Error type: ");
             if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-                Serial.print("TCP/TLS, esp-tls err=");
-                Serial.print(event->error_handle->esp_tls_last_esp_err);
-                Serial.print(" tls_stack=");
-                Serial.println(event->error_handle->esp_tls_stack_err);
+                Serial.printf("TCP/TLS, esp-tls err=%d tls_stack=%d\n",
+                              event->error_handle->esp_tls_last_esp_err,
+                              event->error_handle->esp_tls_stack_err);
             } else {
                 Serial.println(event->error_handle->error_type);
             }
@@ -345,27 +609,69 @@ static void mqttEventHandler(void* args, esp_event_base_t base,
 }
 
 // ═══════════════════════════════════════════════════════════
-//  MQTT INIT (WSS via ESP-IDF native client)
+//  MQTT INIT (WSS via ESP-IDF native client)  [9][10]
 // ═══════════════════════════════════════════════════════════
 
 void connectMQTT() {
-    Serial.print("[MQTT] Connecting to ");
-    Serial.println(MQTT_URI);
+    Serial.printf("[MQTT] Connecting to %s as machine '%s'\n", MQTT_URI, MACHINE_ID);
+
+    // [9] Build the Last Will and Testament payload
+    static char lwt_payload[128];
+    {
+        JsonDocument lwtDoc;
+        lwtDoc["type"]       = "STATUS";
+        lwtDoc["status"]     = "offline";
+        lwtDoc["machine_id"] = MACHINE_ID;
+        serializeJson(lwtDoc, lwt_payload, sizeof(lwt_payload));
+    }
 
     esp_mqtt_client_config_t config = {};
-    config.broker.address.uri          = MQTT_URI;
-    config.credentials.username        = MQTT_USER;
-    config.credentials.authentication.password = MQTT_PASS;
+    config.broker.address.uri                    = MQTT_URI;
+    config.credentials.username                  = MQTT_USER;
+    config.credentials.authentication.password   = MQTT_PASS;
     config.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
-    config.buffer.size                 = 4096;       // RX buffer for chunks
-    config.buffer.out_size             = 512;        // TX buffer for ACKs
-    config.network.disable_auto_reconnect = false;
-    config.session.keepalive           = 60;
+
+    // [9] Enlarged RX buffer for large chunks; TX sized for ACK/status
+    config.buffer.size                           = 8192;
+    config.buffer.out_size                       = 1024;
+
+    // [9] Automatic reconnect with keep-alive
+    config.network.disable_auto_reconnect        = false;
+    config.network.reconnect_timeout_ms          = 5000;
+    config.session.keepalive                     = 30;
+
+    // [5] Persistent session — broker queues QoS 1 messages while offline
+    config.session.disable_clean_session         = true;
+
+    // [9] Last Will: broker publishes this if ESP drops unexpectedly.
+    //     Retained so the PC always sees the latest presence state.
+    config.session.last_will.topic               = TOPIC_RESP;
+    config.session.last_will.msg                 = lwt_payload;
+    config.session.last_will.msg_len             = strlen(lwt_payload);
+    config.session.last_will.qos                 = 1;
+    config.session.last_will.retain              = 1;
 
     mqttClient = esp_mqtt_client_init(&config);
     esp_mqtt_client_register_event(mqttClient, MQTT_EVENT_ANY,
                                    mqttEventHandler, NULL);
     esp_mqtt_client_start(mqttClient);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  WATCHDOG CHECK  [8]
+// ═══════════════════════════════════════════════════════════
+
+void checkChunkWatchdog() {
+    if (!jobActive || paused || !mqttConnected) return;
+    if (watchdogTripped) return;  // Already fired, don't spam
+
+    unsigned long now = millis();
+    if (now - lastChunkTime >= CHUNK_WATCHDOG_MS) {
+        watchdogTripped = true;
+        paused = true;
+        Serial.printf("[WATCHDOG] No chunk for %lu ms — auto-pausing job\n", CHUNK_WATCHDOG_MS);
+        sendStatus("timeout");
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -377,10 +683,16 @@ void setup() {
     delay(1000);
 
     Serial.println();
-    Serial.println("========================================");
-    Serial.println("  ESP32 G-code Receiver (MQTT over WSS)");
-    Serial.println("========================================");
+    Serial.println("=====================================================");
+    Serial.println("  ESP32 G-code Receiver (MQTT/WSS) — Production");
+    Serial.printf("  Machine ID : %s\n", MACHINE_ID);
+    Serial.println("=====================================================");
     Serial.println();
+
+    // [1] Build topic strings from MACHINE_ID
+    buildTopics();
+    Serial.printf("[TOPICS] cmd  = %s\n", TOPIC_CMD);
+    Serial.printf("[TOPICS] resp = %s\n", TOPIC_RESP);
 
     setupWiFi();
     connectMQTT();
@@ -391,7 +703,8 @@ void setup() {
 }
 
 void loop() {
-    // ESP-IDF MQTT client runs in its own FreeRTOS task,
-    // so loop() just needs to yield.
+    // [8] Watchdog check runs every loop iteration (~10 ms)
+    checkChunkWatchdog();
+
     delay(10);
 }

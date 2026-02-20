@@ -97,10 +97,7 @@
         "keepalive": 60,
         "qos": 1,
         "dry_run": false,
-        "topic_command": "cnc/gcode/command",
-        "topic_ack": "cnc/gcode/ack",
-        "topic_control": "cnc/control",
-        "topic_status": "cnc/status",
+        "machine_id": "cnc01",
         "lines_per_chunk": 10,
         "ack_timeout": 30.0,
         "retry_count": 3

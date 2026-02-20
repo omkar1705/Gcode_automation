@@ -1,8 +1,14 @@
 """
-MQTT G-code Test Script
+MQTT G-code Test Script — Production-Grade Protocol
 
 Sends dummy G-code data over MQTT to verify the connection
 between this PC and the ESP32.
+
+Updated to match the two-topic architecture:
+  PC  → ESP:  cnc/<machine_id>/cmd
+  ESP → PC:   cnc/<machine_id>/resp
+
+All messages include sender, machine_id, and type fields.
 
 Usage:
   python test_mqtt.py              # Send dummy gcode, wait for ESP32 ACKs
@@ -34,10 +40,9 @@ USE_TLS     = cfg.get("use_tls", True)
 USER        = cfg["username"]
 PASS        = cfg["password"]
 QOS         = cfg["qos"]
-TOPIC_CMD    = cfg["topic_command"]
-TOPIC_ACK    = cfg["topic_ack"]
-TOPIC_STATUS = cfg["topic_status"]
-TOPIC_CTRL   = cfg["topic_control"]
+MACHINE_ID  = cfg["machine_id"]
+TOPIC_CMD   = f"cnc/{MACHINE_ID}/cmd"
+TOPIC_RESP  = f"cnc/{MACHINE_ID}/resp"
 LINES_PER_CHUNK = cfg["lines_per_chunk"]
 ACK_TIMEOUT     = cfg["ack_timeout"]
 RETRY_COUNT     = cfg.get("retry_count", 3)
@@ -71,25 +76,35 @@ DUMMY_GCODE = [
 ack_event = threading.Event()
 last_ack_seq = -999
 last_ack_status = ""
+last_ack_last_seq_processed = -1
 connected_event = threading.Event()
 esp32_online_event = threading.Event()
 
 
+def build_message(msg_type, **kwargs):
+    """Build a protocol-compliant message with required envelope fields."""
+    msg = {
+        "type": msg_type,
+        "sender": "pc",
+        "machine_id": MACHINE_ID,
+    }
+    msg.update(kwargs)
+    return json.dumps(msg)
+
+
 def on_connect(client, userdata, flags, *args):
-    # Compatible with paho-mqtt v1 (rc) and v2 (rc, properties)
     rc = args[0] if args else 0
     if rc == 0:
         print(f"[OK] Connected to {BROKER}:{PORT}")
-        client.subscribe(TOPIC_ACK, qos=QOS)
-        client.subscribe(TOPIC_STATUS, qos=QOS)
-        print(f"[OK] Subscribed to {TOPIC_ACK}, {TOPIC_STATUS}")
+        client.subscribe(TOPIC_RESP, qos=QOS)
+        print(f"[OK] Subscribed to {TOPIC_RESP}")
         connected_event.set()
     else:
         print(f"[FAIL] Connection refused, rc={rc}")
 
 
 def on_message(client, userdata, msg):
-    global last_ack_seq, last_ack_status
+    global last_ack_seq, last_ack_status, last_ack_last_seq_processed
 
     topic = msg.topic
     try:
@@ -98,18 +113,29 @@ def on_message(client, userdata, msg):
         print(f"[RECV] {topic}: {msg.payload}")
         return
 
-    if topic == TOPIC_ACK:
+    msg_type = payload.get("type", "")
+
+    if msg_type == "ACK":
         seq = payload.get("seq", "?")
         status = payload.get("status", "?")
         lines_exec = payload.get("lines_exec", "?")
-        print(f"  [ACK] seq={seq}  status={status}  lines_exec={lines_exec}")
+        last_seq_p = payload.get("last_seq_processed", "?")
+        job_id = payload.get("job_id", "?")
+        print(f"  [ACK] seq={seq}  status={status}  lines_exec={lines_exec}  "
+              f"last_seq_processed={last_seq_p}  job_id={job_id}")
         last_ack_seq = seq
         last_ack_status = status
+        last_ack_last_seq_processed = last_seq_p
         ack_event.set()
 
-    elif topic == TOPIC_STATUS:
+    elif msg_type == "STATUS":
         print(f"  [STATUS] {json.dumps(payload)}")
-        esp32_online_event.set()
+        status = payload.get("status", "")
+        if status in ("online", "idle", "running", "reconnected"):
+            esp32_online_event.set()
+
+    else:
+        print(f"  [RESP] {json.dumps(payload)}")
 
 
 def wait_for_ack(expected_seq, timeout=None):
@@ -131,7 +157,6 @@ def send_dummy_gcode(client):
     job_id = f"test_{uuid.uuid4().hex[:6]}"
     total_lines = len(DUMMY_GCODE)
 
-    # Build chunks
     chunks = []
     for i in range(0, total_lines, LINES_PER_CHUNK):
         chunks.append(DUMMY_GCODE[i : i + LINES_PER_CHUNK])
@@ -140,28 +165,30 @@ def send_dummy_gcode(client):
     print()
     print("=" * 55)
     print(f"  SENDING DUMMY G-CODE")
-    print(f"  Job ID       : {job_id}")
-    print(f"  Total lines  : {total_lines}")
-    print(f"  Chunk size   : {LINES_PER_CHUNK} lines")
-    print(f"  Total chunks : {total_chunks}")
-    print(f"  Broker       : {BROKER}:{PORT}")
-    print(f"  Command topic: {TOPIC_CMD}")
+    print(f"  Job ID        : {job_id}")
+    print(f"  Machine ID    : {MACHINE_ID}")
+    print(f"  Total lines   : {total_lines}")
+    print(f"  Chunk size    : {LINES_PER_CHUNK} lines")
+    print(f"  Total chunks  : {total_chunks}")
+    print(f"  Broker        : {BROKER}:{PORT}")
+    print(f"  Command topic : {TOPIC_CMD}")
+    print(f"  Response topic: {TOPIC_RESP}")
     print("=" * 55)
     print()
 
     # ── JOB_START (with retry) ──
-    job_start = {
-        "type": "JOB_START",
-        "job_id": job_id,
-        "total_lines": total_lines,
-        "total_chunks": total_chunks,
-        "lines_per_chunk": LINES_PER_CHUNK,
-    }
+    job_start_payload = build_message(
+        "JOB_START",
+        job_id=job_id,
+        total_lines=total_lines,
+        total_chunks=total_chunks,
+        lines_per_chunk=LINES_PER_CHUNK,
+    )
 
     job_started = False
     for attempt in range(1, RETRY_COUNT + 1):
         print(f"[SEND] JOB_START  (attempt {attempt}/{RETRY_COUNT}, waiting for ACK...)")
-        client.publish(TOPIC_CMD, json.dumps(job_start), qos=QOS)
+        client.publish(TOPIC_CMD, job_start_payload, qos=QOS)
 
         if wait_for_ack(-1):
             job_started = True
@@ -177,17 +204,18 @@ def send_dummy_gcode(client):
 
     # ── CHUNKS (with retry) ──
     for seq, chunk in enumerate(chunks):
-        chunk_msg = {
-            "type": "CHUNK",
-            "seq": seq,
-            "lines": chunk,
-        }
+        chunk_payload = build_message(
+            "CHUNK",
+            job_id=job_id,
+            seq=seq,
+            lines=chunk,
+        )
         lines_preview = chunk[0] if chunk else "?"
 
         chunk_ok = False
         for attempt in range(1, RETRY_COUNT + 1):
             print(f"[SEND] CHUNK seq={seq}  ({len(chunk)} lines, first: {lines_preview}, attempt {attempt}/{RETRY_COUNT})")
-            client.publish(TOPIC_CMD, json.dumps(chunk_msg), qos=QOS)
+            client.publish(TOPIC_CMD, chunk_payload, qos=QOS)
 
             if wait_for_ack(seq):
                 chunk_ok = True
@@ -203,9 +231,9 @@ def send_dummy_gcode(client):
     print()
 
     # ── JOB_END ──
-    job_end = {"type": "JOB_END", "job_id": job_id}
+    job_end_payload = build_message("JOB_END", job_id=job_id)
     print(f"[SEND] JOB_END")
-    client.publish(TOPIC_CMD, json.dumps(job_end), qos=QOS)
+    client.publish(TOPIC_CMD, job_end_payload, qos=QOS)
 
     print()
     print("=" * 55)
@@ -214,12 +242,19 @@ def send_dummy_gcode(client):
     return True
 
 
+def send_control(client, control_type):
+    """Send a control message (PAUSE / RESUME / ESTOP)."""
+    payload = build_message(control_type)
+    print(f"[SEND] {control_type}")
+    client.publish(TOPIC_CMD, payload, qos=QOS)
+
+
 def listen_only(client):
     """Just subscribe and print everything — useful for debugging."""
     print()
     print("=" * 55)
     print("  LISTEN MODE — printing all messages from ESP32")
-    print(f"  Subscribed to: {TOPIC_ACK}, {TOPIC_STATUS}")
+    print(f"  Subscribed to: {TOPIC_RESP}")
     print("  Press Ctrl+C to stop")
     print("=" * 55)
     print()
@@ -236,12 +271,15 @@ def main():
         "--listen", action="store_true",
         help="Listen-only mode (don't send, just print ESP32 messages)"
     )
+    parser.add_argument(
+        "--estop", action="store_true",
+        help="Send an emergency stop command"
+    )
     args = parser.parse_args()
 
     # ── Connect ──
     client_id = f"test_pc_{uuid.uuid4().hex[:6]}"
 
-    # Support both paho-mqtt v1 and v2
     try:
         client = mqtt.Client(
             client_id=client_id,
@@ -254,11 +292,9 @@ def main():
             transport=TRANSPORT,
         )
 
-    # WebSocket path
     if TRANSPORT == "websockets":
         client.ws_set_options(path=WS_PATH)
 
-    # TLS for WSS
     if USE_TLS:
         client.tls_set(cert_reqs=ssl.CERT_NONE, tls_version=ssl.PROTOCOL_TLS)
         client.tls_insecure_set(True)
@@ -271,6 +307,7 @@ def main():
 
     proto = "wss" if USE_TLS else "ws"
     print(f"[....] Connecting to {proto}://{BROKER}:{PORT}{WS_PATH} as {client_id}...")
+    print(f"[....] Machine ID: {MACHINE_ID}")
     try:
         client.connect(BROKER, PORT, keepalive=60)
     except Exception as e:
@@ -279,21 +316,22 @@ def main():
 
     client.loop_start()
 
-    # Wait for connection
     if not connected_event.wait(timeout=10):
         print("[FAIL] Connection timed out")
         client.loop_stop()
         return
 
     # ── Run mode ──
-    if args.listen:
+    if args.estop:
+        send_control(client, "ESTOP")
+        time.sleep(2)
+    elif args.listen:
         listen_only(client)
     else:
-        # Wait for the ESP32 to be online (it sends a status on connect)
         print("[....] Waiting for ESP32 to be online...")
         if esp32_online_event.wait(timeout=15):
             print("[OK] ESP32 is online")
-            time.sleep(0.5)  # let subscriptions settle
+            time.sleep(0.5)
             send_dummy_gcode(client)
         else:
             print("[WARN] No ESP32 status received yet, sending anyway...")
