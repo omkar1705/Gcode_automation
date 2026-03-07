@@ -1,5 +1,6 @@
-from fastapi import FastAPI, UploadFile, File
-import shutil
+from http.client import HTTPException
+
+from fastapi import FastAPI 
 import os
 from datetime import datetime
 
@@ -8,14 +9,18 @@ from services.toolpath import plan_rectangle
 from services.gcode import generate_gcode
 from services.mqtt_sender import send_gcode_job
 
+from pydantic import BaseModel
+
+
 app = FastAPI(
     title="CNC Backend Service",
     version="1.0.0"
 )
 
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+UPLOAD_DIR = "/home/omkar/Desktop/backend/uploads/cnc"
 
+class ProcessRequest(BaseModel):
+    image_name: str
 
 @app.get("/")
 def root():
@@ -31,19 +36,23 @@ def health():
     return {"status": "healthy"}
 
 
+
 @app.post("/process")
-async def process(image: UploadFile = File(...)):
-    path = os.path.join(UPLOAD_DIR, image.filename)
-
-    with open(path, "wb") as buffer:
-        shutil.copyfileobj(image.file, buffer)
-
+async def process(request: ProcessRequest):
+    # Construct path to the already-uploaded file
+    path = os.path.join(UPLOAD_DIR, request.image_name)
+    
+    # Verify file exists
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Image not found")
+    
+    # Process the image
     rect = detect_grid(path)
     toolpaths = plan_rectangle(rect)
     gcode = generate_gcode(toolpaths)
-
+    
     job_id = send_gcode_job(gcode)
-
+    
     return {
         "job_id": job_id,
         "status": "sent"
